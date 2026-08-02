@@ -107,6 +107,9 @@ export async function handleWardrobeGenerate(
     const status = error instanceof ProviderError ? error.status : 500;
 
     console.error(`[${reqId}] error [${code}]: ${message}`);
+    if (error instanceof Error && error.stack) {
+      console.error(`[${reqId}] stack trace:\n${error.stack}`);
+    }
     logMemory(`[${reqId}] error path`);
 
     // Return JSON — never let an unhandled error crash the process
