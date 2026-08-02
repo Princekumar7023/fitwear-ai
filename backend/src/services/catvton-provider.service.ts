@@ -9,7 +9,7 @@ import {
   logMemory,
 } from '../utils/image.utils.js';
 
-const CATVTON_SPACE_URL = 'https://zhengchong-catvton.hf.space';
+const CATVTON_SPACE_URL = 'https://princekumar7023-fitwear-catvton.hf.space';
 const CATVTON_CONFIG_URL = `${CATVTON_SPACE_URL}/config`;
 const CATVTON_UPLOAD_URL = `${CATVTON_SPACE_URL}/gradio_api/upload`;
 const CATVTON_QUEUE_URL = `${CATVTON_SPACE_URL}/gradio_api/call/submit_function`;
