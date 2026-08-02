@@ -1,4 +1,39 @@
+import { deflateSync } from 'zlib';
 import { InlineImage } from '../types/wardrobe.js';
+
+// ---------------------------------------------------------------------------
+// Memory helpers
+// ---------------------------------------------------------------------------
+
+export function logMemory(label: string): void {
+  const m = process.memoryUsage();
+  const mb = (n: number) => `${Math.round(n / 1024 / 1024)} MB`;
+  console.log(
+    `[mem] ${label} | rss=${mb(m.rss)} heap=${mb(m.heapUsed)}/${mb(m.heapTotal)} ext=${mb(m.external)}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Base64 ↔ binary conversion  —  use Node.js Buffer throughout.
+// btoa/atob create an intermediate binary STRING equal in size to the
+// decoded bytes, doubling peak memory.  Buffer.from() avoids that copy.
+// ---------------------------------------------------------------------------
+
+export function bytesToBase64(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('base64');
+}
+
+export function base64ToBytes(data: string): Buffer {
+  return Buffer.from(data, 'base64');
+}
+
+export function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  return Buffer.from(buffer).toString('base64');
+}
+
+// ---------------------------------------------------------------------------
+// Data URL parsing
+// ---------------------------------------------------------------------------
 
 export function parseDataUrl(dataUrl: string): InlineImage {
   const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
@@ -11,30 +46,29 @@ export function parseDataUrl(dataUrl: string): InlineImage {
   return { mimeType, data };
 }
 
-export function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let index = 0; index < bytes.length; index += 1) {
-    binary += String.fromCharCode(bytes[index]);
-  }
-  return btoa(binary);
-}
+// ---------------------------------------------------------------------------
+// Image dimension extraction
+//
+// FIX: Previously base64ToBytes(image.data) decoded the ENTIRE image into
+// memory just to read a ~24-byte PNG header or a few-hundred-byte JPEG SOF
+// marker.  For a 10 MB JPEG this created a 10 MB binary string + 10 MB
+// Uint8Array = 20 MB peak allocation per call.
+//
+// Now we decode only the first 8 KB of the base64 payload (≈ 6 KB of binary)
+// which is sufficient for:
+//   • PNG  — signature (8 B) + IHDR (25 B) — we need bytes 0–23 only
+//   • JPEG — SOF marker is typically within the first 2–4 KB for real photos
+// ---------------------------------------------------------------------------
 
-export function base64ToBytes(data: string): Uint8Array {
-  const binary = atob(data);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return bytes;
-}
-
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  return bytesToBase64(new Uint8Array(buffer));
-}
+// 8 KB of binary ≈ 10924 base64 characters
+const HEADER_BASE64_CHARS = Math.ceil((8 * 1024 * 4) / 3);
 
 export function readImageDimensions(image: InlineImage): { width: number; height: number } {
-  const bytes = base64ToBytes(image.data);
+  // Decode only the header prefix — not the full image
+  const prefix = image.data.slice(0, HEADER_BASE64_CHARS);
+  const bytes = Buffer.from(prefix, 'base64');
 
+  // ── PNG ──────────────────────────────────────────────────────────────────
   if (
     bytes.length >= 24 &&
     bytes[0] === 0x89 &&
@@ -42,10 +76,13 @@ export function readImageDimensions(image: InlineImage): { width: number; height
     bytes[2] === 0x4e &&
     bytes[3] === 0x47
   ) {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    return { width: view.getUint32(16), height: view.getUint32(20) };
+    return {
+      width: (bytes[16] << 24 | bytes[17] << 16 | bytes[18] << 8 | bytes[19]) >>> 0,
+      height: (bytes[20] << 24 | bytes[21] << 16 | bytes[22] << 8 | bytes[23]) >>> 0,
+    };
   }
 
+  // ── JPEG ─────────────────────────────────────────────────────────────────
   if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
     const startOfFrameMarkers = new Set([
       0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
@@ -90,6 +127,10 @@ export function readImageDimensions(image: InlineImage): { width: number; height
   throw new Error('Target image must be a PNG or JPEG image.');
 }
 
+// ---------------------------------------------------------------------------
+// PNG chunk builder  (unchanged — only operates on small metadata)
+// ---------------------------------------------------------------------------
+
 function crc32(bytes: Uint8Array): number {
   let value = 0xffffffff;
 
@@ -104,89 +145,76 @@ function crc32(bytes: Uint8Array): number {
   return (value ^ 0xffffffff) >>> 0;
 }
 
-function adler32(bytes: Uint8Array): number {
-  let a = 1;
-  let b = 0;
+function createPngChunk(type: string, data: Buffer): Buffer {
+  const typeBytes = Buffer.from(type, 'ascii');
+  const chunk = Buffer.allocUnsafe(12 + data.length);
 
-  for (const byte of bytes) {
-    a = (a + byte) % 65521;
-    b = (b + a) % 65521;
-  }
-
-  return ((b << 16) | a) >>> 0;
-}
-
-function deflateUncompressed(bytes: Uint8Array): Uint8Array {
-  const chunks: Uint8Array[] = [new Uint8Array([0x78, 0x01])];
-
-  for (let offset = 0; offset < bytes.length; offset += 65_535) {
-    const length = Math.min(65_535, bytes.length - offset);
-    const block = new Uint8Array(5 + length);
-    const view = new DataView(block.buffer);
-    block[0] = offset + length === bytes.length ? 1 : 0;
-    view.setUint16(1, length, true);
-    view.setUint16(3, (~length) & 0xffff, true);
-    block.set(bytes.subarray(offset, offset + length), 5);
-    chunks.push(block);
-  }
-
-  const checksum = new Uint8Array(4);
-  new DataView(checksum.buffer).setUint32(0, adler32(bytes));
-  chunks.push(checksum);
-
-  const compressed = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
-  let offset = 0;
-
-  for (const chunk of chunks) {
-    compressed.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  return compressed;
-}
-
-function createPngChunk(type: string, data: Uint8Array): Uint8Array {
-  const typeBytes = new TextEncoder().encode(type);
-  const chunk = new Uint8Array(12 + data.length);
-  const view = new DataView(chunk.buffer);
-
-  view.setUint32(0, data.length);
-  chunk.set(typeBytes, 4);
-  chunk.set(data, 8);
-  view.setUint32(8 + data.length, crc32(chunk.subarray(4, 8 + data.length)));
+  chunk.writeUInt32BE(data.length, 0);
+  typeBytes.copy(chunk, 4);
+  data.copy(chunk, 8);
+  chunk.writeUInt32BE(crc32(chunk.subarray(4, 8 + data.length)), 8 + data.length);
 
   return chunk;
 }
+
+// ---------------------------------------------------------------------------
+// Transparent mask synthesis
+//
+// FIX: The original deflateUncompressed() used BTYPE=0 (store, no compression)
+// so the output size ≈ input size.  For a 4000×3000 phone photo:
+//
+//   rawPixels                        = height * (1 + width*4)
+//                                    = 3000 * 16001  ≈  48 MB
+//   deflateUncompressed output       ≈  48 MB  (another full copy in chunks[])
+//   final concatenated Uint8Array    ≈  48 MB  (third copy)
+//   peak mask allocation             ≈ 144 MB
+//
+// Fix: replace with Node.js built-in zlib.deflateSync (RFC 1950 = the format
+// PNG IDAT requires).  All-zero pixel data is highly repetitive and compresses
+// to < 100 KB regardless of image size.
+//
+//   rawPixels                        ≈  48 MB  (unavoidable — freed after call)
+//   deflateSync output               ≈  80 KB
+//   peak mask allocation             ≈  48 MB  (vs 144 MB before)
+// ---------------------------------------------------------------------------
 
 export function createTransparentMask({ width, height }: { width: number; height: number }): InlineImage {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
     throw new Error('Target image has invalid dimensions.');
   }
 
-  const rawPixels = new Uint8Array(height * (1 + width * 4));
-  const header = new Uint8Array(13);
-  const headerView = new DataView(header.buffer);
-  headerView.setUint32(0, width);
-  headerView.setUint32(4, height);
-  header[8] = 8;
-  header[9] = 6;
-  const png = [
-    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    createPngChunk('IHDR', header),
-    createPngChunk('IDAT', deflateUncompressed(rawPixels)),
-    createPngChunk('IEND', new Uint8Array()),
-  ];
-  const length = png.reduce((total, chunk) => total + chunk.length, 0);
-  const bytes = new Uint8Array(length);
-  let offset = 0;
+  logMemory(`createTransparentMask start (${width}×${height})`);
 
-  for (const chunk of png) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
+  // All-zero RGBA rows (each row: 1-byte filter tag + width*4 bytes)
+  const rawPixels = Buffer.alloc(height * (1 + width * 4));
 
-  return { mimeType: 'image/png', data: bytesToBase64(bytes) };
+  // IHDR: 4B width + 4B height + 1B bit-depth + 1B colour-type + 3B zeroes
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 6;  // RGBA colour type
+
+  // zlib.deflateSync produces RFC 1950 (zlib-wrapped deflate) — exactly what PNG IDAT needs.
+  // Level 1 = fastest compression; all-zero data still shrinks to ~80 KB regardless of image size.
+  const idatData = deflateSync(rawPixels, { level: 1 });
+
+  const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const pngBytes = Buffer.concat([
+    pngSignature,
+    createPngChunk('IHDR', ihdr),
+    createPngChunk('IDAT', idatData),
+    createPngChunk('IEND', Buffer.alloc(0)),
+  ]);
+
+  logMemory('createTransparentMask end');
+
+  return { mimeType: 'image/png', data: pngBytes.toString('base64') };
 }
+
+// ---------------------------------------------------------------------------
+// Upload validation  (name accurately reflects: validation only, no compression)
+// ---------------------------------------------------------------------------
 
 /**
  * Validates image payload prior to external AI model submission.

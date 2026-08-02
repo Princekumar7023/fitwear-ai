@@ -2,12 +2,11 @@ import { IVirtualTryOnProvider } from './ai-provider.interface.js';
 import { InlineImage } from '../types/wardrobe.js';
 import { env } from '../config/env.js';
 import {
-  base64ToBytes,
   createTransparentMask,
   readImageDimensions,
   parseDataUrl,
   validateImageBeforeUpload,
-  arrayBufferToBase64,
+  logMemory,
 } from '../utils/image.utils.js';
 
 const CATVTON_SPACE_URL = 'https://zhengchong-catvton.hf.space';
@@ -138,18 +137,25 @@ export class CatVTONProviderService implements IVirtualTryOnProvider {
     throw lastError || new ProviderError(502, 'provider_unavailable', `CatVTON is unavailable during ${operation}.`);
   }
 
+  // FIX: removed intermediate Blob step.
+  // Old path: response → Blob (copy 1) → blob.arrayBuffer() (copy 2) → btoa string (copy 3)
+  // New path: response → arrayBuffer() (copy 1) → Buffer.toString('base64') (copy 2)
+  // Saves one full image-size allocation per downloaded image.
   public async urlToInlineImage(url: string): Promise<InlineImage> {
     const response = await this.fetchWithTimeoutAndRetry(url, {}, 'image download');
-    const blob = await response.blob();
+    const arrayBuffer = await response.arrayBuffer();
+    const mimeType = response.headers.get('content-type')?.split(';')[0] || 'image/png';
     return {
-      mimeType: blob.type || 'image/png',
-      data: arrayBufferToBase64(await blob.arrayBuffer()),
+      mimeType,
+      data: Buffer.from(arrayBuffer).toString('base64'),
     };
   }
 
   private async uploadImage(image: InlineImage, fileName: string): Promise<CatVTONFile> {
     const validated = validateImageBeforeUpload(image);
     const formData = new FormData();
+    // Buffer.from(base64, 'base64') allocates once; Blob references that buffer.
+    // Both are eligible for GC as soon as fetch completes.
     formData.append(
       'files',
       new Blob([Buffer.from(validated.data, 'base64')], { type: validated.mimeType }),
@@ -285,12 +291,34 @@ export class CatVTONProviderService implements IVirtualTryOnProvider {
   }
 
   public async generateTryOn(referenceImage: InlineImage, targetImage: InlineImage): Promise<InlineImage> {
-    const transparentMask = createTransparentMask(readImageDimensions(targetImage));
-    const [personImage, clothImage, maskImage] = await Promise.all([
-      this.uploadImage(targetImage, 'person-image.png'),
-      this.uploadImage(referenceImage, 'clothing-reference.png'),
-      this.uploadImage(transparentMask, 'transparent-mask.png'),
-    ]);
+    logMemory('generateTryOn start');
+
+    // Step 1: read only the header prefix of the target image to get dimensions
+    console.log('[step] reading image dimensions');
+    const dims = readImageDimensions(targetImage);
+    console.log(`[step] dimensions resolved: ${dims.width}×${dims.height}`);
+    logMemory('after readImageDimensions');
+
+    // Step 2: create compressed transparent mask (zlib.deflateSync — not stored blocks)
+    console.log('[step] creating transparent mask');
+    const transparentMask = createTransparentMask(dims);
+    logMemory('after createTransparentMask');
+
+    // Step 3: upload all three images sequentially to keep peak memory lower.
+    // Previously Promise.all uploaded concurrently — all three buffers lived
+    // simultaneously.  Sequential upload allows each buffer to be GC'd before
+    // the next is allocated.
+    console.log('[step] uploading person image');
+    const personImage = await this.uploadImage(targetImage, 'person-image.png');
+    logMemory('after person upload');
+
+    console.log('[step] uploading reference clothing image');
+    const clothImage = await this.uploadImage(referenceImage, 'clothing-reference.png');
+    logMemory('after cloth upload');
+
+    console.log('[step] uploading mask image');
+    const maskImage = await this.uploadImage(transparentMask, 'transparent-mask.png');
+    logMemory('after mask upload');
 
     const inputs = [
       {
@@ -306,10 +334,16 @@ export class CatVTONProviderService implements IVirtualTryOnProvider {
       CATVTON_SETTINGS.showType,
     ];
 
+    console.log('[step] submitting generation to CatVTON');
     const result = (await this.catVTONUsesQueue())
       ? await this.pollQueuedGeneration(await this.submitQueuedGeneration(inputs))
       : await this.runSynchronousGeneration(inputs);
+    logMemory('after CatVTON generation');
 
-    return this.downloadGeneratedImage(this.getGeneratedImageUrl(result));
+    console.log('[step] downloading generated image');
+    const generated = await this.downloadGeneratedImage(this.getGeneratedImageUrl(result));
+    logMemory('generateTryOn end');
+
+    return generated;
   }
 }

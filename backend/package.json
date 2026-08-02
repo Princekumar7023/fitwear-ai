@@ -8,7 +8,7 @@
     "build:clean": "rm -rf dist && tsc",
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
-    "start:prod": "NODE_ENV=production node dist/server.js",
+    "start:prod": "NODE_ENV=production node --max-old-space-size=400 dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
   },
   "dependencies": {
