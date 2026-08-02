@@ -39,7 +39,8 @@ export default function ResultScreen() {
 
     async function generateLook() {
       try {
-        const response = await fetch('/api/wardrobe', {
+        const baseUrl = process.env.EXPO_PUBLIC_API_URL ? process.env.EXPO_PUBLIC_API_URL.replace(/\/$/, '') : '';
+        const response = await fetch(`${baseUrl}/api/wardrobe`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

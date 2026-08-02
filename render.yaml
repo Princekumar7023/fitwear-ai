@@ -1,0 +1,25 @@
+# Render Infrastructure-as-Code Blueprint
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: fitwear-backend
+    env: node
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: HF_MAX_RETRIES
+        value: "3"
+      - key: CATVTON_TIMEOUT_MS
+        value: "180000"
+      - key: HF_TOKEN
+        sync: false # Set securely in the Render dashboard during deployment

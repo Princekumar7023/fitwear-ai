@@ -1,0 +1,30 @@
+{
+  "name": "fitwear-backend",
+  "version": "1.0.0",
+  "description": "Production Express TypeScript Backend for FitWear AI Virtual Try-On",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "build:clean": "rm -rf dist && tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "start:prod": "NODE_ENV=production node dist/server.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.17.14",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": true
+}
